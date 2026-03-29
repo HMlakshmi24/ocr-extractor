@@ -1,0 +1,13 @@
+streamlit
+python-dotenv
+easyocr
+spacy
+opencv-python-headless
+pdf2image
+pandas
+openpyxl
+Pillow
+numpy
+python-docx
+PyMuPDF
+openai

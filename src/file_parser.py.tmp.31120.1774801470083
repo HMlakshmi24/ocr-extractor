@@ -1,0 +1,238 @@
+import os
+import sys
+import io
+import cv2
+import numpy as np
+from PIL import Image
+from pdf2image import convert_from_bytes
+import docx
+import fitz
+
+# Use bundled Poppler on Windows; rely on system PATH on Linux/macOS (e.g. Streamlit Cloud)
+if sys.platform == 'win32':
+    POPPLER_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                'poppler', 'poppler-24.08.0', 'Library', 'bin')
+    if not os.path.exists(POPPLER_PATH):
+        POPPLER_PATH = None
+else:
+    POPPLER_PATH = None
+_global_counter = 1
+
+def generate_id():
+    global _global_counter
+    cid = f"card_{_global_counter:03d}"
+    _global_counter += 1
+    return cid
+
+def reset_counter():
+    global _global_counter
+    _global_counter = 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Card splitting
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _find_h_splits(proj, total, min_seg_pct=0.08):
+    """
+    Horizontal (row) splits via bright→dark TRANSITION detection.
+
+    Uses peak-of-gutter positioning so the split lands at the whitest point,
+    not at an arbitrary midpoint. Correctly handles both:
+      - Wide gutters  (17-30 px) between most card rows
+      - Ultra-thin gutters (1-2 px) where the scan barely shows any whitespace
+
+    Key thresholds (validated against real scanned PDFs):
+      BRIGHT = 244  — catches all real gutters (value ≥ 252) while staying above
+                      the intra-card line-spacing brightness ceiling (~243)
+      DARK   = 210  — reliably below all card content rows
+    """
+    BRIGHT   = 248   # intra-card line-spacing peaks at ~246; real gutters reach 252+
+    DARK     = 210
+    MIN_SEG  = int(total * min_seg_pct)
+
+    smooth = np.convolve(proj, np.ones(3) / 3, mode='same')
+
+    splits        = [0]
+    in_bright     = float(smooth[0]) >= BRIGHT
+    gutter_start  = 0 if in_bright else -1
+
+    for i in range(1, total):
+        v = float(smooth[i])
+        if not in_bright and v >= BRIGHT:
+            in_bright    = True
+            gutter_start = i
+        elif in_bright and v < DARK:
+            in_bright = False
+            if gutter_start >= 0:
+                # Place split at the BRIGHTEST point within the gutter
+                region = smooth[gutter_start:i]
+                peak   = gutter_start + int(np.argmax(region))
+                if peak - splits[-1] >= MIN_SEG:
+                    splits.append(peak)
+
+    splits.append(total)
+    return splits
+
+
+def _find_v_splits(proj, total, min_seg_pct=0.08):
+    """
+    Vertical (column) splits via strict brightness + minimum-width filter.
+
+    Uses a higher threshold (252) and minimum band width (22 px) to suppress
+    false splits caused by card-internal white margins/logos/design elements.
+    Real column gutters are 25-40 px wide and average ≥ 252 brightness.
+    """
+    THRESHOLD  = 252
+    MIN_GUTTER = 22
+    MIN_SEG    = int(total * min_seg_pct)
+
+    splits         = [0]
+    in_gutter      = False
+    gutter_start   = 0
+
+    for i, v in enumerate(proj):
+        if v >= THRESHOLD and not in_gutter:
+            in_gutter    = True
+            gutter_start = i
+        elif v < THRESHOLD and in_gutter:
+            in_gutter    = False
+            gutter_width = i - gutter_start
+            mid          = (gutter_start + i) // 2
+            if gutter_width >= MIN_GUTTER and mid - splits[-1] >= MIN_SEG:
+                splits.append(mid)
+
+    splits.append(total)
+    return splits
+
+
+def _projection_split(pil_img):
+    """
+    Split a scanned multi-card page into individual card crops.
+
+    Algorithm:
+      1. Convert to grayscale, binarise with a FIXED threshold of 160
+         (better than OTSU for high-brightness scanned pages where OTSU
+          assigns nearly all pixels to the 'white' class; 160 keeps
+          dark-card border bleed pixels from contaminating gutter rows)
+      2. H projection  → transition-based row detection
+      3. V projection  → strict-threshold column detection
+      4. Crop each grid cell, skip tiny slivers (< 5 % of page dimension)
+    """
+    cv_img = np.array(pil_img)
+    gray   = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY) if len(cv_img.shape) == 3 else cv_img
+    img_h, img_w = gray.shape
+
+    # Fixed threshold instead of OTSU — OTSU mis-classifies mid-grays as white
+    # on scanned pages whose mean brightness already exceeds 230/255.
+    # 160 (not 180) is used so that dark-card border bleed pixels (grayscale
+    # 160-178) are classified as white; this prevents those bleed pixels from
+    # dragging gutter row averages below the BRIGHT=248 detection threshold.
+    _, binary = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY)
+
+    h_proj = np.mean(binary, axis=1)   # per-row average
+    v_proj = np.mean(binary, axis=0)   # per-column average
+
+    h_splits = _find_h_splits(h_proj, img_h)
+    v_splits = _find_v_splits(v_proj, img_w)
+
+    cards = []
+    PAD = 6
+    for i in range(len(h_splits) - 1):
+        y1, y2 = h_splits[i], h_splits[i + 1]
+        # Skip rows that are nearly all-white (page margins / blank bottom area)
+        row_avg = float(np.mean(h_proj[y1:y2]))
+        if row_avg > 250:
+            continue
+        # Skip slivers thinner than 5 % of page height
+        if (y2 - y1) < img_h * 0.05:
+            continue
+        for j in range(len(v_splits) - 1):
+            x1, x2 = v_splits[j], v_splits[j + 1]
+            if (x2 - x1) < img_w * 0.05:
+                continue
+            crop = pil_img.crop((
+                max(0, x1 - PAD), max(0, y1 - PAD),
+                min(img_w, x2 + PAD), min(img_h, y2 + PAD)
+            ))
+            cards.append(crop)
+
+    return cards
+
+
+def split_cards_from_page(pil_img):
+    """
+    Detect and split individual business cards from a scanned page.
+    Returns a list of PIL Images — one per card detected.
+    Falls back to the full page as a single card if the split yields < 2 results.
+    """
+    cards = _projection_split(pil_img)
+    # Drop fragments too small to contain readable text
+    cards = [c for c in cards if c.width >= 80 and c.height >= 80]
+    return cards if len(cards) >= 2 else [pil_img]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# File parsing
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_file(uploaded_file, file_name):
+    """
+    Parse an uploaded file and return individual business card images.
+    Returns: list of (image_id, PIL_Image) tuples.
+    """
+    images_with_ids = []
+    ext        = os.path.splitext(file_name)[1].lower()
+    file_bytes = uploaded_file.read()
+
+    def add_page(pil_img):
+        for card in split_cards_from_page(pil_img.convert('RGB')):
+            images_with_ids.append((generate_id(), card))
+
+    if ext in ['.jpg', '.jpeg', '.png']:
+        try:
+            add_page(Image.open(io.BytesIO(file_bytes)))
+        except Exception as e:
+            print(f"Image load error {file_name}: {e}")
+
+    elif ext == '.pdf':
+        pages = []
+        try:
+            poppler_bin = POPPLER_PATH
+            # 250 DPI gives good OCR quality without excessive memory use
+            pages = convert_from_bytes(file_bytes, dpi=250, poppler_path=poppler_bin)
+        except Exception as e:
+            print(f"pdf2image failed ({e}), trying PyMuPDF…")
+            try:
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                for i in range(len(doc)):
+                    pix = doc.load_page(i).get_pixmap(matrix=fitz.Matrix(3, 3))
+                    pages.append(Image.frombytes("RGB", [pix.width, pix.height], pix.samples))
+            except Exception as ie:
+                print(f"PyMuPDF also failed: {ie}")
+        for page in pages:
+            add_page(page)
+
+    elif ext in ['.docx', '.doc']:
+        try:
+            doc = docx.Document(io.BytesIO(file_bytes))
+            for rel in doc.part.rels.values():
+                if "image" in rel.target_ref:
+                    try:
+                        add_page(Image.open(io.BytesIO(rel.target_part.blob)))
+                    except Exception:
+                        pass
+        except Exception:
+            import zipfile
+            try:
+                with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+                    for item in z.namelist():
+                        if item.startswith('word/media/'):
+                            try:
+                                add_page(Image.open(io.BytesIO(z.read(item))))
+                            except Exception:
+                                pass
+            except Exception as ze:
+                print(f"DOCX extraction failed: {ze}")
+
+    return images_with_ids

@@ -1,0 +1,218 @@
+import cv2
+import numpy as np
+from PIL import Image
+import easyocr
+import streamlit as st
+
+
+@st.cache_resource
+def load_ocr():
+    return easyocr.Reader(['en'], verbose=False)
+
+
+# ── Image preparation ─────────────────────────────────────────────────────────
+
+def _upscale(pil_img, min_dim=900):
+    """Ensure the shorter side is at least min_dim pixels for reliable OCR."""
+    w, h = pil_img.size
+    short = min(w, h)
+    if short < min_dim:
+        scale = min_dim / short
+        pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    return pil_img
+
+
+def _deskew(pil_img):
+    """
+    Correct small rotations (≤ 30°) using Hough line angle detection.
+    Only applies correction when angle ≥ 1.5° to avoid touching already-straight cards.
+    """
+    cv_img = np.array(pil_img)
+    gray   = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY) if len(cv_img.shape) == 3 else cv_img
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges  = cv2.Canny(blurred, 50, 150, apertureSize=3)
+    lines  = cv2.HoughLinesP(edges, 1, np.pi / 180,
+                             threshold=80, minLineLength=60, maxLineGap=10)
+    if lines is None:
+        return pil_img
+
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if x2 != x1:
+            a = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            if -30 < a < 30:
+                angles.append(a)
+
+    if not angles:
+        return pil_img
+
+    angle = float(np.median(angles))
+    if abs(angle) < 1.5:        # < 1.5° is not worth correcting
+        return pil_img
+
+    h, w = cv_img.shape[:2]
+    M       = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    rotated = cv2.warpAffine(cv_img, M, (w, h),
+                             flags=cv2.INTER_CUBIC,
+                             borderMode=cv2.BORDER_REPLICATE)
+    return Image.fromarray(rotated)
+
+
+# ── Preprocessing variants ────────────────────────────────────────────────────
+
+def _preprocess_variants(pil_img):
+    """
+    7 preprocessing variants to maximise OCR accuracy across different card styles
+    (white background, dark background, colored, low contrast, noisy scans, etc.)
+    """
+    cv_img = np.array(pil_img)
+    bgr    = cv_img[:, :, ::-1].copy() if (len(cv_img.shape) == 3 and cv_img.shape[2] == 3) \
+             else cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGR)
+    gray   = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    # CLAHE — adaptive local contrast
+    clahe     = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe_img = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+
+    # Sharpened
+    sharp_k   = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.cvtColor(cv2.filter2D(gray, -1, sharp_k), cv2.COLOR_GRAY2BGR)
+
+    # Denoised
+    denoised  = cv2.cvtColor(cv2.fastNlMeansDenoising(gray, h=10), cv2.COLOR_GRAY2BGR)
+
+    # Bilateral (edge-preserving smooth)
+    bilateral = cv2.cvtColor(
+        cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75),
+        cv2.COLOR_GRAY2BGR
+    )
+
+    # Otsu binary — helps low-contrast and dark-background cards
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    otsu_bgr = cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR)
+
+    # Inverted Otsu — for dark-background white-text cards
+    inv_otsu = cv2.cvtColor(cv2.bitwise_not(otsu), cv2.COLOR_GRAY2BGR)
+
+    return [bgr, cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR),
+            clahe_img, sharpened, denoised, bilateral, otsu_bgr, inv_otsu]
+
+
+# ── Text reconstruction ───────────────────────────────────────────────────────
+
+def _to_structured_text(results, img_h):
+    """
+    Convert EasyOCR bbox results into reading-order text.
+    Groups by y-position (line), sorts each line left→right.
+    """
+    if not results:
+        return "", 0.0
+
+    items = []
+    for bbox, text, conf in results:
+        y_c = (bbox[0][1] + bbox[2][1]) / 2
+        x_l = bbox[0][0]
+        items.append((y_c, x_l, text, conf))
+
+    items.sort(key=lambda r: r[0])
+    line_thr = max(img_h * 0.04, 8)
+
+    lines = [[items[0]]]
+    for item in items[1:]:
+        if abs(item[0] - lines[-1][0][0]) <= line_thr:
+            lines[-1].append(item)
+        else:
+            lines.append([item])
+
+    text_lines, total_conf, count = [], 0.0, 0
+    for line in lines:
+        line.sort(key=lambda r: r[1])
+        text_lines.append(' '.join(r[2] for r in line))
+        for r in line:
+            total_conf += r[3]
+            count += 1
+
+    return '\n'.join(text_lines), (total_conf / count if count else 0.0)
+
+
+# ── Orientation detection ─────────────────────────────────────────────────────
+
+_ROTATE_FLAGS = {
+    90:  cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+def _detect_best_orientation(pil_img, ocr_model):
+    """
+    Quick 4-rotation probe using a single grayscale OCR pass per angle.
+    Returns the rotation angle (0 / 90 / 180 / 270) that yields the highest
+    average text confidence — i.e. the card's natural reading orientation.
+    """
+    cv_img = np.array(pil_img)
+    gray   = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY) if len(cv_img.shape) == 3 else cv_img
+
+    best_conf  = -1.0
+    best_angle = 0
+
+    for angle in [0, 90, 180, 270]:
+        probe = cv2.rotate(gray, _ROTATE_FLAGS[angle]) if angle != 0 else gray
+        results = ocr_model.readtext(probe)
+        if not results:
+            continue
+        _, conf = _to_structured_text(results, probe.shape[0])
+        if conf > best_conf:
+            best_conf  = conf
+            best_angle = angle
+
+    return best_angle
+
+
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+
+def run_ocr_pipeline(pil_img, ocr_model):
+    """
+    Full per-card OCR pipeline:
+      1. Upscale to ≥ 1200px (short side) for reliable text detection
+      2. Auto-orient: quick 4-rotation probe picks reading orientation
+      3. Deskew to correct residual slight tilts
+      4. Invert dark-background (white-on-black) cards
+      5. Run 8 preprocessing variants, pick the one with highest average confidence
+      6. Return spatially-ordered text + confidence score
+    """
+    img = _upscale(pil_img, min_dim=1200)
+
+    # Step 2: Auto-orient (rotation must come BEFORE deskew — deskew only
+    # corrects angles up to ±30°, not 90°/180° flips)
+    best_angle = _detect_best_orientation(img, ocr_model)
+    if best_angle == 90:
+        img = img.rotate(90, expand=True)
+    elif best_angle == 180:
+        img = img.rotate(180)
+    elif best_angle == 270:
+        img = img.rotate(270, expand=True)
+
+    # Step 3: Deskew residual tilt
+    img = _deskew(img)
+
+    # Step 4: Dark-background cards — invert so EasyOCR sees dark-on-light text
+    if np.array(img).mean() < 110:
+        img = Image.fromarray(cv2.bitwise_not(np.array(img)))
+
+    # Step 5: Multi-variant OCR
+    variants  = _preprocess_variants(img)
+    best_text = ""
+    best_conf = 0.0
+
+    for variant in variants:
+        results = ocr_model.readtext(variant)
+        if not results:
+            continue
+        text, conf = _to_structured_text(results, img.height)
+        if conf > best_conf:
+            best_conf = conf
+            best_text = text
+
+    return best_text, best_conf

@@ -1,0 +1,216 @@
+import os
+import io
+import cv2
+import numpy as np
+from PIL import Image
+from pdf2image import convert_from_bytes
+import docx
+import fitz  # PyMuPDF
+
+POPPLER_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'poppler', 'poppler-24.08.0', 'Library', 'bin')
+_global_counter = 1
+
+def generate_id():
+    global _global_counter
+    card_id = f"card_{_global_counter:03d}"
+    _global_counter += 1
+    return card_id
+
+def reset_counter():
+    global _global_counter
+    _global_counter = 1
+
+
+def _find_splits(proj, total_size, min_seg_ratio=0.07):
+    """
+    Find split positions in a projection profile.
+    Looks for high-brightness (whitespace/gutter) regions between cards.
+    Uses relative threshold (88% of max) to handle varying scan brightness.
+    """
+    smoothed = np.convolve(proj, np.ones(9) / 9, mode='same')
+    threshold = max(smoothed) * 0.88
+    min_seg = int(total_size * min_seg_ratio)
+
+    splits = [0]
+    in_gutter = False
+    gutter_start = 0
+
+    for i, val in enumerate(smoothed):
+        if val >= threshold and not in_gutter:
+            in_gutter = True
+            gutter_start = i
+        elif val < threshold and in_gutter:
+            in_gutter = False
+            mid = (gutter_start + i) // 2
+            if mid - splits[-1] >= min_seg:
+                splits.append(mid)
+
+    splits.append(total_size)
+    return splits
+
+
+def _projection_split(pil_img):
+    """
+    Primary split method: uses horizontal/vertical whitespace projection profiles.
+    Robust for any grid layout (2x2, 3x4, 4x3, etc.) and card backgrounds.
+    """
+    cv_img = np.array(pil_img)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY) if len(cv_img.shape) == 3 else cv_img
+    img_h, img_w = gray.shape
+
+    # OTSU binarization: adaptive to any brightness level
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    h_proj = np.mean(binary, axis=1)   # per-row average brightness
+    v_proj = np.mean(binary, axis=0)   # per-column average brightness
+
+    h_splits = _find_splits(h_proj, img_h)
+    v_splits = _find_splits(v_proj, img_w)
+
+    n_rows = len(h_splits) - 1
+    n_cols = len(v_splits) - 1
+
+    cards = []
+    for i in range(n_rows):
+        for j in range(n_cols):
+            y1, y2 = h_splits[i], h_splits[i + 1]
+            x1, x2 = v_splits[j], v_splits[j + 1]
+
+            # Skip slivers smaller than 5% of page in either dimension
+            if (y2 - y1) < img_h * 0.05 or (x2 - x1) < img_w * 0.05:
+                continue
+
+            # Small padding so no edge text is clipped
+            pad = 6
+            crop = pil_img.crop((
+                max(0, x1 - pad), max(0, y1 - pad),
+                min(img_w, x2 + pad), min(img_h, y2 + pad)
+            ))
+            cards.append(crop)
+
+    return cards
+
+
+def _contour_split(pil_img):
+    """
+    Fallback split method using morphological contour detection.
+    Used when projection method finds fewer than 2 cards.
+    """
+    cv_img = np.array(pil_img)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY) if len(cv_img.shape) == 3 else cv_img
+    img_h, img_w = gray.shape
+    img_area = img_h * img_w
+
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    kernel = np.ones((25, 45), np.uint8)
+    dilated = cv2.dilate(thresh, kernel, iterations=4)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    candidates = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = w * h
+        if area < 0.015 * img_area or area > 0.45 * img_area:
+            continue
+        ratio = max(w, h) / min(w, h)
+        if ratio < 1.1 or ratio > 5.5:
+            continue
+        pad = 10
+        crop = pil_img.crop((
+            max(0, x - pad), max(0, y - pad),
+            min(img_w, x + w + pad), min(img_h, y + h + pad)
+        ))
+        candidates.append((crop, y, x))
+
+    if len(candidates) < 2:
+        return [pil_img]
+
+    # Sort reading order: group into rows, then sort each row left-to-right
+    candidates.sort(key=lambda c: c[1])
+    row_threshold = img_h * 0.18
+    rows, current_row = [], [candidates[0]]
+    for card in candidates[1:]:
+        if abs(card[1] - current_row[0][1]) < row_threshold:
+            current_row.append(card)
+        else:
+            rows.append(sorted(current_row, key=lambda c: c[2]))
+            current_row = [card]
+    rows.append(sorted(current_row, key=lambda c: c[2]))
+
+    return [c[0] for row in rows for c in row]
+
+
+def split_cards_from_page(pil_img):
+    """
+    Detects and splits individual business cards from a scanned page.
+    Tries projection profile first (best for scanned grids), falls back to contour detection.
+    """
+    cards = _projection_split(pil_img)
+    if len(cards) >= 2:
+        return cards
+    cards = _contour_split(pil_img)
+    if len(cards) >= 2:
+        return cards
+    return [pil_img]
+
+
+def parse_file(uploaded_file, file_name):
+    """
+    Parses uploaded file and returns individual card images.
+    Returns: list of (image_id, PIL_Image) tuples.
+    """
+    images_with_ids = []
+    ext = os.path.splitext(file_name)[1].lower()
+    file_bytes = uploaded_file.read()
+
+    def add_cards(pil_img):
+        for card in split_cards_from_page(pil_img.convert('RGB')):
+            images_with_ids.append((generate_id(), card))
+
+    if ext in ['.jpg', '.jpeg', '.png']:
+        try:
+            add_cards(Image.open(io.BytesIO(file_bytes)))
+        except Exception as e:
+            print(f"Error loading image {file_name}: {e}")
+
+    elif ext == '.pdf':
+        pages = []
+        try:
+            poppler_bin = POPPLER_PATH if os.path.exists(POPPLER_PATH) else None
+            pages = convert_from_bytes(file_bytes, dpi=200, poppler_path=poppler_bin)
+        except Exception as e:
+            print(f"pdf2image failed: {e}. Trying PyMuPDF...")
+            try:
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                for i in range(len(doc)):
+                    pix = doc.load_page(i).get_pixmap(matrix=fitz.Matrix(2, 2))
+                    pages.append(Image.frombytes("RGB", [pix.width, pix.height], pix.samples))
+            except Exception as ie:
+                print(f"PyMuPDF also failed: {ie}")
+        for page in pages:
+            add_cards(page)
+
+    elif ext in ['.docx', '.doc']:
+        try:
+            doc = docx.Document(io.BytesIO(file_bytes))
+            for rel in doc.part.rels.values():
+                if "image" in rel.target_ref:
+                    try:
+                        add_cards(Image.open(io.BytesIO(rel.target_part.blob)))
+                    except Exception:
+                        pass
+        except Exception as e:
+            import zipfile
+            try:
+                with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+                    for item in archive.namelist():
+                        if item.startswith('word/media/'):
+                            try:
+                                add_cards(Image.open(io.BytesIO(archive.read(item))))
+                            except Exception:
+                                pass
+            except Exception as ze:
+                print(f"Failed DOCX extraction: {e} | {ze}")
+
+    return images_with_ids

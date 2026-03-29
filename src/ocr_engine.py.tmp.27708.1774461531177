@@ -1,0 +1,210 @@
+import cv2
+import numpy as np
+from PIL import Image
+import easyocr
+import streamlit as st
+
+
+@st.cache_resource
+def load_ocr():
+    return easyocr.Reader(['en'], verbose=False)
+
+
+# ──────────────────────────────────────────────
+# 1. Image preparation
+# ──────────────────────────────────────────────
+
+def _upscale(pil_img, min_dim=800):
+    """Upscale small images so OCR has enough resolution to read fine text."""
+    w, h = pil_img.size
+    short = min(w, h)
+    if short < min_dim:
+        scale = min_dim / short
+        pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    return pil_img
+
+
+def _deskew(pil_img):
+    """
+    Correct slight rotation (up to ±30°) using Hough line angle detection.
+    Returns a corrected PIL image.
+    """
+    cv_img = np.array(pil_img)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY) if len(cv_img.shape) == 3 else cv_img
+
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
+                            threshold=80, minLineLength=60, maxLineGap=10)
+    if lines is None:
+        return pil_img
+
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if x2 != x1:
+            a = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            if -30 < a < 30:          # only near-horizontal lines
+                angles.append(a)
+
+    if not angles:
+        return pil_img
+
+    angle = float(np.median(angles))
+    if abs(angle) < 0.5:              # no meaningful skew
+        return pil_img
+
+    h, w = cv_img.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    rotated = cv2.warpAffine(cv_img, M, (w, h),
+                             flags=cv2.INTER_CUBIC,
+                             borderMode=cv2.BORDER_REPLICATE)
+    return Image.fromarray(rotated)
+
+
+def _detect_best_rotation(pil_img, ocr_model):
+    """
+    Try 0°, 90°, 180°, 270° on a downscaled image.
+    Return the rotation (degrees) that yields the most recognised characters.
+    This is fast because the image is shrunk to ≤300px before the check.
+    """
+    cv_img = np.array(pil_img)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY) if len(cv_img.shape) == 3 else cv_img
+    h, w = gray.shape
+    scale = min(1.0, 300 / max(h, w))
+    small = cv2.resize(gray, (int(w * scale), int(h * scale)))
+
+    best_angle, best_chars = 0, 0
+    for angle in [0, 90, 180, 270]:
+        if angle == 0:
+            test = small
+        else:
+            center = (small.shape[1] // 2, small.shape[0] // 2)
+            M = cv2.getRotationMatrix2D(center, -angle, 1.0)
+            test = cv2.warpAffine(small, M, (small.shape[1], small.shape[0]))
+        results = ocr_model.readtext(cv2.cvtColor(test, cv2.COLOR_GRAY2BGR))
+        char_count = sum(len(r[1]) for r in results)
+        if char_count > best_chars:
+            best_chars = char_count
+            best_angle = angle
+
+    return best_angle
+
+
+def _apply_rotation(pil_img, angle):
+    """Rotate PIL image by angle degrees (counter-clockwise, expanding canvas)."""
+    if angle == 0:
+        return pil_img
+    return pil_img.rotate(-angle, expand=True)   # PIL rotate is CCW; -angle = CW
+
+
+def _prepare_image(pil_img, ocr_model):
+    """
+    Full image preparation pipeline:
+      1. Upscale if too small
+      2. Deskew (correct slight tilt)
+      3. Detect & apply best 90° rotation
+    Returns a corrected, high-res PIL image ready for OCR.
+    """
+    img = _upscale(pil_img)
+    img = _deskew(img)
+    best_rot = _detect_best_rotation(img, ocr_model)
+    img = _apply_rotation(img, best_rot)
+    return img
+
+
+# ──────────────────────────────────────────────
+# 2. Preprocessing variants
+# ──────────────────────────────────────────────
+
+def _preprocess_variants(pil_img):
+    """6 preprocessing variants for maximum OCR accuracy across card styles."""
+    cv_img = np.array(pil_img)
+    bgr = cv_img[:, :, ::-1].copy() if (len(cv_img.shape) == 3 and cv_img.shape[2] == 3) \
+          else cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe_img = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+
+    sharp_k = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.cvtColor(cv2.filter2D(gray, -1, sharp_k), cv2.COLOR_GRAY2BGR)
+
+    denoised = cv2.cvtColor(cv2.fastNlMeansDenoising(gray, h=10), cv2.COLOR_GRAY2BGR)
+
+    bilateral = cv2.cvtColor(
+        cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75),
+        cv2.COLOR_GRAY2BGR
+    )
+
+    # Otsu threshold — helps on noisy or low-contrast scans
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    otsu_bgr = cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR)
+
+    return [bgr, cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR),
+            clahe_img, sharpened, denoised, bilateral, otsu_bgr]
+
+
+# ──────────────────────────────────────────────
+# 3. Structured text reconstruction
+# ──────────────────────────────────────────────
+
+def _to_structured_text(results, img_h):
+    """
+    Convert EasyOCR bbox results into spatially-aware text.
+    Groups detections into lines by y-position; sorts each line left→right.
+    """
+    if not results:
+        return "", 0.0
+
+    items = []
+    for bbox, text, conf in results:
+        y_c = (bbox[0][1] + bbox[2][1]) / 2
+        x_l = bbox[0][0]
+        items.append((y_c, x_l, text, conf))
+
+    items.sort(key=lambda r: r[0])
+    line_thr = max(img_h * 0.04, 8)
+
+    lines = [[items[0]]]
+    for item in items[1:]:
+        if abs(item[0] - lines[-1][0][0]) <= line_thr:
+            lines[-1].append(item)
+        else:
+            lines.append([item])
+
+    text_lines, total_conf, count = [], 0.0, 0
+    for line in lines:
+        line.sort(key=lambda r: r[1])
+        text_lines.append(' '.join(r[2] for r in line))
+        for r in line:
+            total_conf += r[3]
+            count += 1
+
+    return '\n'.join(text_lines), (total_conf / count if count else 0.0)
+
+
+# ──────────────────────────────────────────────
+# 4. Main pipeline
+# ──────────────────────────────────────────────
+
+def run_ocr_pipeline(pil_img, ocr_model):
+    """
+    Full OCR pipeline:
+      - Corrects rotation & tilt at any angle
+      - Runs 7 preprocessing variants
+      - Returns best spatially-structured text + confidence score
+    """
+    img = _prepare_image(pil_img, ocr_model)
+    variants = _preprocess_variants(img)
+    best_text, best_conf = "", 0.0
+
+    for variant in variants:
+        results = ocr_model.readtext(variant)
+        if not results:
+            continue
+        text, conf = _to_structured_text(results, img.height)
+        if conf > best_conf:
+            best_conf = conf
+            best_text = text
+
+    return best_text, best_conf

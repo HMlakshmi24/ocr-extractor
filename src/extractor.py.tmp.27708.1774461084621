@@ -1,0 +1,166 @@
+import re
+import json
+from openai import OpenAI
+
+_client = OpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key="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"
+)
+
+_SYSTEM_PROMPT = """You are a precise business card data extraction expert.
+Given OCR text from a single business card, return ONLY a valid JSON object with exactly these keys:
+Name, Title, Company, Email, Phone, Address, City, State, Zip, Country, Website
+
+=== EXTRACTION RULES ===
+
+NAME:
+- The individual person's full name (e.g. "Joshua Del Rio", "Nicole Elam", "Philip J. Grasso")
+- Include professional credentials after name if present: "Ph.D.", "P.E.", "Jr.", "Sr."
+- Do NOT put company name here
+- Usually the largest/most prominent text or the most human-sounding name on the card
+
+TITLE:
+- The person's job title or position (e.g. "Sales Engineer", "Vice President", "Executive Vice President")
+- Multi-word titles are fine: "Director, Sales & Global Hydrogen"
+- Do NOT truncate — capture the full title as written
+
+COMPANY:
+- The organization name only (e.g. "TOSHIBA", "KEYENCE CORP OF AMERICA", "T & T Group, Inc.")
+- Do NOT include address or contact info here
+
+EMAIL:
+- PREFER personal/direct email: one that contains the person's name, initials, or first name
+  (e.g. "joshua@epconlp.com", "nicole.elam@keyence.com", "pgrasso@elitecontrols.us")
+- AVOID generic company emails: info@, sales@, contact@, admin@, support@, orders@
+- If only a generic email exists, use it
+- Must look like a valid email address (contains @)
+
+PHONE:
+- PREFER numbers labeled "Direct", "Cell", "Mobile" over "Main" or "Office"
+- If multiple unlabeled numbers, use the first one
+- Format cleanly with area code: "(936) 242-1303" or "+1 281-455-4406"
+- Do NOT include fax numbers (labeled "Fax") unless it's the only number
+- Fix obvious OCR errors in phone numbers (e.g. "281 - -765⁹" → clean it up)
+
+ADDRESS:
+- Street address ONLY — no city, state, or ZIP
+- Examples: "1500 Post Oak Boulevard", "P.O. Box 7060", "9950 Woodloch Forest Dr, 4th Floor"
+- If only P.O. Box exists, use that
+
+CITY:
+- City name only (e.g. "Houston", "The Woodlands", "Marietta")
+
+STATE:
+- 2-letter US state code preferred (e.g. "TX", "GA") or full name if not US
+
+ZIP:
+- ZIP code (e.g. "77387" or "77387-1234")
+
+COUNTRY:
+- If address is clearly US-based (has state like TX, GA, etc.) and country not stated → "USA"
+- Otherwise use the stated country name
+
+WEBSITE:
+- Company website URL, clean format without "www." prefix unless needed for clarity
+- Examples: "epconlp.com", "keyence.com", "elitecontrols.us"
+- Do NOT use email domain as website unless it's explicitly shown as a URL
+
+=== OUTPUT FORMAT ===
+Return ONLY the JSON object. No explanation, no markdown fences, no extra text.
+Use "" for any field genuinely not found on the card."""
+
+
+def _extract_with_llm(text: str) -> dict:
+    completion = _client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": f"Extract contact information from this business card OCR text:\n\n{text}"}
+        ],
+        temperature=0.0,
+        top_p=1,
+        max_tokens=512,
+        stream=False
+    )
+    raw = completion.choices[0].message.content.strip()
+
+    # Strip markdown code fences if model includes them
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+
+    return json.loads(raw)
+
+
+def _extract_with_regex(text: str) -> dict:
+    """Regex fallback when LLM API is unavailable."""
+    data = {k: '' for k in ['Name', 'Title', 'Company', 'Email', 'Phone',
+                             'Address', 'City', 'State', 'Zip', 'Country', 'Website']}
+
+    emails = re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', text)
+    # Prefer personal email (not generic prefix)
+    generic = {'info', 'sales', 'contact', 'admin', 'support', 'orders', 'hello', 'mail'}
+    personal = [e for e in emails if e.split('@')[0].lower() not in generic]
+    data['Email'] = (personal[0] if personal else emails[0]).strip() if emails else ''
+
+    phones = re.findall(r'(\+?\d[\d\s.\-()]{7,}\d)', text)
+    if phones:
+        data['Phone'] = re.sub(r'\s+', ' ', phones[0]).strip()
+
+    zips = re.findall(r'\b\d{5}(?:-\d{4})?\b', text)
+    if zips:
+        data['Zip'] = zips[0]
+
+    urls = re.findall(r'(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:/\S*)?', text)
+    if emails:
+        dom = emails[0].split('@')[1]
+        urls = [u for u in urls if dom not in u and '@' not in u and len(u) > 5]
+    for u in urls:
+        if 'www' in u or 'http' in u or '.' in u:
+            data['Website'] = u.strip()
+            break
+
+    address_kw = ['st', 'ave', 'blvd', 'rd', 'dr', 'ln', 'ct', 'way', 'pkwy', 'box', 'floor']
+    titles_kw = ['director', 'manager', 'president', 'ceo', 'cto', 'engineer', 'developer',
+                 'consultant', 'sales', 'lead', 'vp', 'partner', 'owner', 'founder',
+                 'specialist', 'executive', 'purchasing', 'shipping']
+
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    for line in lines:
+        ll = line.lower()
+        if not data['Title'] and len(line) < 60 and any(t in ll for t in titles_kw):
+            data['Title'] = line
+        elif not data['Address'] and re.search(r'\b\d+\b', ll) and any(k in ll for k in address_kw):
+            data['Address'] = line
+
+    skip = {data['Email'], data['Phone'], data['Website'], data['Title'], data['Address']}
+    for line in lines:
+        if line in skip:
+            continue
+        words = line.split()
+        if not data['Name'] and 1 < len(words) <= 5 and not re.search(r'\d', line):
+            data['Name'] = line
+        elif not data['Company'] and len(words) <= 7:
+            data['Company'] = line
+
+    return data
+
+
+def extract_fields(text: str) -> dict:
+    """
+    Extract structured contact fields from raw OCR text.
+    Uses NVIDIA gpt-oss-120b LLM for accuracy; falls back to regex on error.
+    """
+    empty = {k: '' for k in ['Name', 'Title', 'Company', 'Email', 'Phone',
+                              'Address', 'City', 'State', 'Zip', 'Country', 'Website']}
+    if not text or not text.strip():
+        return empty
+
+    try:
+        result = _extract_with_llm(text)
+        for key in empty:
+            val = result.get(key)
+            result[key] = str(val).strip() if val else ''
+        return result
+    except Exception:
+        return _extract_with_regex(text)

@@ -1,0 +1,105 @@
+import cv2
+import numpy as np
+import easyocr
+import streamlit as st
+
+
+@st.cache_resource
+def load_ocr():
+    return easyocr.Reader(['en'], verbose=False)
+
+
+def _preprocess_variants(pil_img):
+    """Generate 5 preprocessing variants for best OCR accuracy."""
+    cv_img = np.array(pil_img)
+    bgr = cv_img[:, :, ::-1].copy() if (len(cv_img.shape) == 3 and cv_img.shape[2] == 3) \
+          else cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGR)
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    # CLAHE — adaptive contrast, better than plain histogram equalization
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe_img = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+
+    # Sharpened
+    sharp_k = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.cvtColor(cv2.filter2D(gray, -1, sharp_k), cv2.COLOR_GRAY2BGR)
+
+    # Denoised
+    denoised = cv2.cvtColor(cv2.fastNlMeansDenoising(gray, h=10), cv2.COLOR_GRAY2BGR)
+
+    # Bilateral filtered (preserves edges, smooths noise)
+    bilateral = cv2.cvtColor(
+        cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75),
+        cv2.COLOR_GRAY2BGR
+    )
+
+    return [
+        bgr,                                        # 1. original
+        cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR),     # 2. grayscale
+        clahe_img,                                  # 3. CLAHE
+        sharpened,                                  # 4. sharpened
+        denoised,                                   # 5. denoised
+        bilateral,                                  # 6. bilateral
+    ]
+
+
+def _to_structured_text(results, img_h):
+    """
+    Convert EasyOCR results to spatially-aware structured text.
+    Groups detections into lines by y-position, sorts each line left-to-right.
+    Preserves the visual reading order of the card layout.
+    """
+    if not results:
+        return "", 0.0
+
+    # Each result: (bbox, text, confidence)  bbox = [[x0,y0],[x1,y0],[x1,y1],[x0,y1]]
+    items = []
+    for bbox, text, conf in results:
+        y_center = (bbox[0][1] + bbox[2][1]) / 2
+        x_left = bbox[0][0]
+        items.append((y_center, x_left, text, conf))
+
+    # Sort by y_center
+    items.sort(key=lambda r: r[0])
+
+    # Group into lines (within 4% of card height)
+    line_threshold = max(img_h * 0.04, 8)
+    lines = [[items[0]]]
+    for item in items[1:]:
+        if abs(item[0] - lines[-1][0][0]) <= line_threshold:
+            lines[-1].append(item)
+        else:
+            lines.append([item])
+
+    text_lines = []
+    total_conf, count = 0.0, 0
+    for line in lines:
+        line.sort(key=lambda r: r[1])           # sort by x within line
+        text_lines.append(' '.join(r[2] for r in line))
+        for r in line:
+            total_conf += r[3]
+            count += 1
+
+    avg_conf = total_conf / count if count > 0 else 0.0
+    return '\n'.join(text_lines), avg_conf
+
+
+def run_ocr_pipeline(pil_img, ocr_model):
+    """
+    Runs OCR on 6 preprocessing variants, picks the one with highest confidence.
+    Returns spatially-structured text and the best confidence score.
+    """
+    variants = _preprocess_variants(pil_img)
+    best_text, best_conf = "", 0.0
+
+    for img in variants:
+        results = ocr_model.readtext(img)
+        if not results:
+            continue
+        text, conf = _to_structured_text(results, pil_img.height)
+        if conf > best_conf:
+            best_conf = conf
+            best_text = text
+
+    return best_text, best_conf

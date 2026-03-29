@@ -1,0 +1,201 @@
+import io
+import os
+import pandas as pd
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# ── Column definitions ────────────────────────────────────────────────────────
+
+EXPORT_COLS = ['Image_ID', 'Name', 'Title', 'Company', 'Email',
+               'Phone', 'Address', 'City', 'State', 'Zip',
+               'Country', 'Website', 'Confidence']
+
+_STATUS_MAP = {
+    'Name': 'status_name', 'Company': 'status_company', 'Title': 'status_title',
+    'Email': 'status_email', 'Phone': 'status_phone', 'Address': 'status_address',
+    'City': 'status_city', 'State': 'status_state', 'Country': 'status_country',
+    'Website': 'status_website', 'Zip': 'status_zip',
+}
+
+_COL_WIDTHS = {
+    'Image_ID': 10, 'Name': 22, 'Title': 28, 'Company': 22, 'Email': 28,
+    'Phone': 18, 'Address': 30, 'City': 16, 'State': 8, 'Zip': 10,
+    'Country': 12, 'Website': 24, 'Confidence': 12,
+}
+
+# ── Styles ────────────────────────────────────────────────────────────────────
+
+_GREEN  = PatternFill("solid", fgColor="C6EFCE")
+_YELLOW = PatternFill("solid", fgColor="FFEB9C")
+_RED    = PatternFill("solid", fgColor="FFC7CE")
+_STRIPE = PatternFill("solid", fgColor="F2F2F2")
+_HEADER = PatternFill("solid", fgColor="1F4E79")
+_STATUS_FILL = {'🟢': _GREEN, '🟡': _YELLOW, '🔴': _RED}
+
+_THIN   = Side(style='thin', color='BFBFBF')
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+
+# ── Fuzzy column aliases for template matching ─────────────────────────────────
+
+_ALIASES = {
+    'image_id':   ['image id', 'card id', 'id', 'card no', 'card#'],
+    'name':       ['full name', 'person name', 'contact name', 'name'],
+    'title':      ['job title', 'position', 'role', 'designation', 'title'],
+    'company':    ['company name', 'organization', 'employer', 'firm', 'company'],
+    'email':      ['email address', 'e-mail', 'email', 'mail'],
+    'phone':      ['phone number', 'telephone', 'tel', 'mobile', 'cell', 'phone', 'contact no'],
+    'address':    ['street address', 'address line 1', 'street', 'address'],
+    'city':       ['city', 'town'],
+    'state':      ['state', 'province', 'region'],
+    'zip':        ['zip code', 'postal code', 'postcode', 'pin', 'zip'],
+    'country':    ['country', 'nation'],
+    'website':    ['website', 'url', 'web', 'site', 'homepage'],
+    'confidence': ['confidence', 'ocr confidence', 'score', 'accuracy'],
+}
+
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _style_header(ws):
+    for cell in ws[1]:
+        cell.fill = _HEADER
+        cell.font = Font(bold=True, color='FFFFFF', size=11)
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.border = _BORDER
+    ws.row_dimensions[1].height = 22
+
+
+def _style_data_rows(ws, df, col_names, start_row=2):
+    for row_idx, df_row in enumerate(df.itertuples(index=False), start=start_row):
+        for col_idx, col_name in enumerate(col_names, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.alignment = Alignment(vertical='center', wrap_text=False)
+            cell.border = _BORDER
+
+            status_col = _STATUS_MAP.get(col_name)
+            if status_col and status_col in df.columns:
+                status_val = df.iloc[row_idx - start_row].get(status_col, '')
+                fill = _STATUS_FILL.get(str(status_val).strip())
+                if fill:
+                    cell.fill = fill
+                    continue
+
+            if row_idx % 2 == 0:
+                cell.fill = _STRIPE
+
+
+def _set_col_widths(ws, col_names):
+    for col_idx, col_name in enumerate(col_names, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = \
+            _COL_WIDTHS.get(col_name, 18)
+
+
+def _match_headers(ws):
+    """
+    Read the header row of an existing worksheet.
+    Returns dict: our_field_lower → excel_col_index (1-based).
+    """
+    header_map = {}   # excel_header_lower → col_index
+    for col_idx in range(1, ws.max_column + 1):
+        val = ws.cell(row=1, column=col_idx).value
+        if val:
+            header_map[str(val).strip().lower()] = col_idx
+
+    field_to_col = {}
+    for field in EXPORT_COLS:
+        fl = field.lower()
+        if fl in header_map:
+            field_to_col[field] = header_map[fl]
+            continue
+        for alias in _ALIASES.get(fl, []):
+            if alias in header_map:
+                field_to_col[field] = header_map[alias]
+                break
+
+    return field_to_col
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def export_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """
+    Create a formatted Excel file in memory and return as bytes.
+    No disk I/O — safe for cloud deployment.
+    """
+    for col in EXPORT_COLS:
+        if col not in df.columns:
+            df[col] = ''
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Contacts'
+
+    # Write header row
+    for col_idx, col_name in enumerate(EXPORT_COLS, start=1):
+        ws.cell(row=1, column=col_idx, value=col_name)
+
+    # Write data rows
+    export_df = df[EXPORT_COLS].copy()
+    for row_idx, row in enumerate(export_df.itertuples(index=False), start=2):
+        for col_idx, value in enumerate(row, start=1):
+            ws.cell(row=row_idx, column=col_idx, value=str(value) if value else '')
+
+    _style_header(ws)
+    _style_data_rows(ws, df, EXPORT_COLS)
+    _set_col_widths(ws, EXPORT_COLS)
+    ws.freeze_panes = 'A2'
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def append_to_existing_excel(df: pd.DataFrame, template_bytes: bytes) -> bytes:
+    """
+    Append extracted card rows to an existing Excel file (user's template).
+
+    - Reads the header row to find which column = which field (fuzzy match)
+    - Appends new data starting from the first empty row
+    - Preserves all existing data, formatting, and extra columns
+    - Colors new cells green/yellow/red based on validation status
+    - Returns the updated file as bytes
+    """
+    wb = load_workbook(io.BytesIO(template_bytes))
+    ws = wb.active
+
+    field_to_col = _match_headers(ws)
+
+    # Find first truly empty row (skip any existing data rows)
+    first_empty = ws.max_row + 1
+    # Double-check: walk backwards to find real last row with data
+    for r in range(ws.max_row, 1, -1):
+        if any(ws.cell(row=r, column=c).value not in (None, '')
+               for c in range(1, ws.max_column + 1)):
+            first_empty = r + 1
+            break
+
+    for row_offset, (_, df_row) in enumerate(df.iterrows()):
+        excel_row = first_empty + row_offset
+        for field, col_idx in field_to_col.items():
+            value = df_row.get(field, '')
+            cell = ws.cell(row=excel_row, column=col_idx)
+            cell.value = str(value).strip() if value else ''
+            cell.alignment = Alignment(vertical='center', wrap_text=False)
+            cell.border = _BORDER
+
+            # Apply status color
+            status_col = _STATUS_MAP.get(field)
+            if status_col and status_col in df.columns:
+                status_val = str(df_row.get(status_col, '')).strip()
+                fill = _STATUS_FILL.get(status_val)
+                if fill:
+                    cell.fill = fill
+                    continue
+
+            if excel_row % 2 == 0:
+                cell.fill = _STRIPE
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
