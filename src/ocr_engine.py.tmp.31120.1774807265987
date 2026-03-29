@@ -170,7 +170,7 @@ def run_ocr_pipeline(pil_img, ocr_model):
       5. Run 8 preprocessing variants, pick the one with highest average confidence
       6. Return spatially-ordered text + confidence score
     """
-    img = _upscale(pil_img, min_dim=800)
+    img = _upscale(pil_img, min_dim=1200)
 
     # Step 2: Auto-orient (rotation must come BEFORE deskew — deskew only
     # corrects angles up to ±30°, not 90°/180° flips)
